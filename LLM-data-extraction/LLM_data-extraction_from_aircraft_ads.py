@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+
+"""
+compute_full_engine_metrics.py
+
+1. Loads Test42Inputs.xlsx (sheet 'Sheet1') with columns:
+     - ID
+     - Description (raw ad text)
+
+2. Extracts, for each ad:
+     • TTAF         – Time To Aircraft Frame (alias for total hours)
+     • TSN          – Time Since New
+     • CSN          – Cycles Since New
+     • TSOH         – Time Since Overhaul (if given)
+     • Early TBO    – Mid‐life threshold (fixed at 4000h)
+     • Hours since HSI
+     • Date of Last HSI
+     • Time remaining before overhaul
+     • On Condition_R (boolean)
+     • Basis of Calculation (which field drove the “remaining”)
+     • Date of Last Overhaul
+     • Date of Overhaul Due
+     • years_left_for_operation
+     • Avg Hours left for operation according to 450 h/yr
+     • Engine Program Name Ongoing or enrolled_1
+
+3. Applies business rules:
+     • TBO = 8000h, mid‐life (HSI) at 4000h or 10 yr
+     • Overhaul due at earlier of (TBO OR 20 years) OR (HSI + 4000h OR 10 yr)
+     • “On Condition” engines → flag special
+     • “Corporate Care/JSSI/etc” paid programs → treat as full life
+
+4. Writes out a new workbook TestAnswers_updated_full.xlsx with these fields.
+
+Dependencies:
+    pip install pandas openpyxl python-dateutil
+"""
+
+"""
+compute_engine_metrics.py
+
+Reads ads from Interview20250501_result/Test42Inputs.xlsx,
+extracts engine metrics via OpenAI and regex fallbacks,
+computes all derived fields, and writes results to
+Interview20250501_result/TestAnswers_filled.xlsx.
+"""
+
+# Add this at the top of your script
+from dotenv import load_dotenv
+
+# Load .env file
+load_dotenv()
+
+# Now read the API key from the environment
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+
+import os
+import re
+import json
+from datetime import datetime, timedelta
+import pandas as pd
+from dateutil import parser as date_parser
+import openai
+
+# 1) Working directory & paths
+cwd  = os.getcwd()
+path = os.path.join(cwd, 'Interview20250501_result')
+INPUT_ADS    = os.path.join(path, 'Test42Inputs.xlsx')
+INPUT_ANS    = os.path.join(path, 'TestAnswers.xlsx')
+OUTPUT_FILE  = os.path.join(path, 'TestAnswers_filled.xlsx')
+ADS_SHEET    = 'Sheet1'
+ANS_SHEET    = 'Answers'
+
+# 2) Engine lifecycle rules(Constants)
+
+tbo_hours = 8000
+midlife_hours = 4000
+annual_usage=450
+
+TODAY = datetime.today().date()
+
+LEFT_PATTERNS = [r'(\\d+)\\s+hrs?\\s+left', r'Remaining[:\\s]+(\\d+)\\s+hrs?']
+PROG_PATTERN = r'(JSSI|MSP|Corporate Care|Rolls Royce Corporate Care|Honeywell HAPP)'
+DATE_PATTERNS = [r'Last HSI[:\\s]+([A-Za-z0-9 ,/-]+)', r'Date of HSI[:\\s]+([A-Za-z0-9 ,/-]+)']
+
+# System prompt used for LLM
+SYSTEM_PROMPT = (
+    "You are an expert JSON extraction assistant specialized in parsing Gulfstream G-IV, G-IVSP, and G450 aircraft ads.\n\n"
+    "Your task is to extract detailed engine data for BOTH LEFT and RIGHT engines from free-form ad text.  "
+    "Return **only** a JSON object with two keys—\"LEFT\" and \"RIGHT\"—each containing an object with exactly these fields in this order:\n\n"
+    
+    "  • TTAF: total airframe hours (integer). Look anywhere in the ad for patterns matching:\n"
+    "       - `Airframe Total Time (\\d+)`\n"
+    "       - `TTAF:\\s*(\\d+)\\s*Hrs`\n"
+    "       - `Airframe:\\s*(\\d+)\\s*Hrs`\n\n"
+    "  • TSN: time since new (hours, integer)\n"
+    "  • CSN: cycles since new (integer)\n"
+    "  • TSML: time since mid-life/HSI (hours, integer)\n"
+    "  • TSOH: time since last overhaul (hours, float)\n"
+    "  • CSML: cycles since mid-life (integer)\n"
+    "  • CSOH: cycles since overhaul (integer)\n"
+    "  • EarlyTBO: mid-life interval (integer). **If the engine table includes a “Mid life next due” (or similar) column, use that value**, else default to 4000\n"
+    "  • HoursSinceHSI: same as TSML (integer)\n"
+    "  • DateOfLastHSI: ISO-8601 date (YYYY-MM-DD) of last HSI, or null. Extract any `<Month> <Year>` following “Midlife c/w” or “Ten Year Calendar:”\n"
+    "  • TimeRemainingBeforeOverhaul: EarlyTBO - TSML (number)\n"
+    "  • OnCondition_R: true if “On Condition” appears anywhere, else false\n"
+    "  • BasisOfCalculation: one of “TSN”, “TSML”, “explicit”, “program”, “on_condition”\n"
+    "  • DateOfLastOverhaul: ISO-8601 date of last overhaul, or null\n"
+    "  • DateOfOverhaulDue: ISO-8601 date when next overhaul is due, or null\n"
+    "  • years_left_for_operation: TimeRemainingBeforeOverhaul ÷ 450 (float), or null\n"
+    "  • AvgHoursLeft_450h_per_year: same as TimeRemainingBeforeOverhaul (float)\n"
+    "  • EngineProgramNameOngoingOrEnrolled_1: maintenance program name, or “None”\n\n"
+
+    "**Formatting rules:**\n"
+    "  - JSON numbers for numeric fields (no quotes)\n"
+    "  - Strings in double quotes\n"
+    "  - ISO 8601 dates (YYYY-MM-DD)\n"
+    "  - true/false for booleans\n"
+    "  - null for missing values\n\n"
+
+    "**Engine-table column headers may begin with any of these variants (whitespace-delimited):**\n"
+    "  1. Loc. Make Model Serial# TSN CSN TSML L\n"
+    "  2. Loc. Make Model Serial# TSN CSN L\n"
+    "  3. Loc. Make Model Serial# TSN CSN TSOH L\n"
+    "  4. Loc. Make Model Serial# TSML L\n"
+    "  5. Loc. Make Model Serial# TSN CSN CSOH TSML CSML TSOH L\n"
+    "  6. Loc. Model Serial# TSN CSN L\n"
+    "  7. Loc. TSN CSN TSOH CSOH L\n\n"
+
+    "**Parsing procedure:**\n"
+    "  1. Extract TTAF using regex from the entire ad.\n"
+    "  2. Find the first line whose tokens include “TSN” and “CSN” (case-insensitive).\n"
+    "  3. Split that header on whitespace; record its zero-based indices of TSN, CSN, TSML, TSOH, CSOH, CSML, and any “Mid life next due” column → EarlyTBO_IDX.\n"
+    "  4. Read the next two lines below the header as the LEFT and RIGHT engine rows.\n"
+    "     - Use the side label token in each row to assign LEFT or RIGHT:\n"
+    "           Acceptable LEFT labels: “L”, “Left”, “Engine 1”\n"
+    "           Acceptable RIGHT labels: “R”, “Right”, “Engine 2”\n"
+    "     - Engine rows can appear in any order (LEFT may be first or second).\n"
+    "     - If the narrative includes paired values (e.g., 'Midlife c/w', 'Overhaul next due'),\n"
+    "       assign the first value to the LEFT engine, second to the RIGHT.\n"
+    "  5. Parse each row on whitespace using the column indices.\n"
+    "  6. Extract narrative HSI date using `<Month> <Year>` after “Midlife c/w” or “Ten Year Calendar:”, convert to `YYYY-MM-01`.\n"
+    "  7. Detect OnCondition_R if “On Condition” is mentioned anywhere.\n"
+    "  8. Compute:\n"
+    "     - TimeRemainingBeforeOverhaul = max(0, EarlyTBO − TSML)\n"
+    "     - years_left_for_operation = TimeRemainingBeforeOverhaul ÷ 450\n"
+    "     - AvgHoursLeft_450h_per_year = TimeRemainingBeforeOverhaul\n"
+    "  9. Emit ONLY the final JSON with “LEFT” and “RIGHT” keys — no explanations, no extra keys, no commentary.\n\n"
+    "Now extract structured JSON for both engines from this ad text:"
+)
+
+
+
+
+
+# Function to extract data from ad text
+def call_llm_extraction(ad_text, ad_id=None):
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"Ad text:\n\"\"\"\n{ad_text}\n\"\"\"\n\nJSON:"}
+            ],
+            temperature=0,
+            max_tokens=1500,
+            stop=["\n\n"]
+        )
+        raw = response.choices[0].message.content
+        match = re.search(r'{.*}', raw, re.DOTALL)
+        parsed = json.loads(match.group(0)) if match else {}
+
+        left = parsed.get("LEFT", {})
+        right = parsed.get("RIGHT", {})
+
+        for engine, position in [(left, "LEFT"), (right, "RIGHT")]:
+            engine["Position"] = position
+            engine["ID"] = ad_id
+           
+        return [left, right]
+
+    except Exception as e:
+        print(f"Error parsing ad (ID={ad_id}): {e}")
+        return []
+    
+
+# 6) Helper extraction functions
+def extract_number(text, patterns):
+    """
+    Try each regex in patterns (a list of strings), return first match as int or None.
+    """
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+# 7) Compute all metrics for one ad
+def compute_metrics(ad_text, ad_id):
+    # 1) Raw extraction via LLM
+    engine_data = call_llm_extraction(ad_text, ad_id)
+
+    results = []
+    for fields in engine_data:
+
+        # 2) Fallback regex for numeric fields
+        tsn  = fields.get('TSN') 
+        tsml = fields.get('TSML') 
+        csn  = fields.get('CSN') 
+        tsoh = fields.get('TSOH') 
+
+        # 3) Normalize LastOverhaulDate to a datetime.date
+        last_ov_raw = fields.get('DateOfLastOverhaul')
+        if isinstance(last_ov_raw, str):
+            try:
+                last_ov = date_parser.parse(last_ov_raw).date()
+            except:
+                last_ov = None
+        else:
+            last_ov = last_ov_raw
+
+        # 4) OnCondition and MaintenanceProgram
+        on_cond = bool(fields.get('OnCondition_R'))
+        prog    = fields.get('EngineProgramNameOngoingOrEnrolled_1') or ''
+        pmatch  = re.search(PROG_PATTERN, prog or ad_text, re.IGNORECASE)
+        program_name = pmatch.group(1) if pmatch else None
+
+        # 5) Derive basics
+        early_tbo       =  fields.get('EarlyTBO')
+        hours_since_hsi =  fields.get('HoursSinceHSI') 
+        date_last_hsi   = fields.get('DateOfLastHSI')  # not in text
+
+        # 6) Compute remaining & basis
+        rem, basis = None, None
+        if program_name:
+            rem, basis = tbo_hours, 'program'
+        else:
+            explicit = extract_number(ad_text, LEFT_PATTERNS)
+            if explicit is not None:
+                rem = explicit
+                basis = 'explicit'
+            elif tsml is not None:
+                rem = max(0, midlife_hours - tsml)
+                basis = 'Time Since Mid-Life(TSML)'
+            elif tsoh is not None:
+                rem = max(0, tbo_hours - tsoh)
+                basis = 'time since last overhaul(TSOH)'
+            elif tsn is not None:
+                rem = max(0, tbo_hours - tsn)
+                basis = 'Time Since New(TSN)'             
+
+        years_left = round(rem / annual_usage, 2) if rem is not None else None
+        avg_hours_left_450h_per_year = rem
+        
+        # Date of Overhaul Due
+        due_date = fields.get('DateOfOverhaulDue')
+        if isinstance(due_date, str):
+            try:
+                due_date = date_parser.parse(due_date).date()
+            except:
+                due_date = None
+        else:
+            due_date = due_date
+
+        if not due_date:
+            candidates = []
+            if last_ov:
+                candidates.append(last_ov + timedelta(days=20 * 365))
+            if tsml is not None or tsn is not None:
+                used = tsml if tsml is not None else tsn
+                hrs_left = tbo_hours - used
+                yrs = hrs_left / annual_usage
+                candidates.append(TODAY + timedelta(days=yrs * 365))
+            due_date = min(candidates) if candidates else None
+
+            # 8) Years & avg-hours left
+            years_left = ((due_date - TODAY).days / 365.25) if due_date else None
+            avg_hours_left_450h_per_year   = years_left * annual_usage if years_left else None
+
+        # 9) Return all metrics
+        results.append({
+            'ID': ad_id,
+            'Text': ad_text,
+            'TTAF': fields.get('TTAF'),
+            'Position' : fields.get('Position'),
+            'TSN': tsn,
+            'CSN': csn,
+            'TSOH': tsoh,
+            'Early TBO': early_tbo,
+            'Hours since HSI': hours_since_hsi,
+            'Date of Last HSI': date_last_hsi,
+            'Time remaining before overhaul': rem,
+            'On Condition_R': on_cond,
+            'Basis of Calculation': basis,
+            'Date of Last Overhaul': fields.get('DateOfLastOverhaul'),
+            'Date of Overhaul Due': fields.get('DateOfOverhaulDue'),
+            'years_left_for_operation': years_left,
+            'Avg Hours left for operation according to 450 hours annual usage': avg_hours_left_450h_per_year,
+            'Engine Program Name Ongoing or enrolled_1': prog
+        })
+    
+    return results
+
+
+# 8) Main execution
+df_ads = pd.read_excel(INPUT_ADS, sheet_name=ADS_SHEET)
+df_ans = pd.read_excel(INPUT_ANS, sheet_name=ANS_SHEET)
+
+all_records = []
+for _, row in df_ads.iterrows():
+    metrics = compute_metrics(str(row['Description']), row['ID'])
+    #metrics['ID'] = [row['ID'], None]
+    all_records.extend(metrics)
+
+
+df_computed = pd.DataFrame(all_records)
+#df_merged   = df_ans.merge(df_computed, on='ID', how='left')
+
+# Write out the filled Answers + Computed sheet
+with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
+    #df_merged.to_excel(writer, sheet_name=ANS_SHEET, index=False)
+    df_computed.to_excel(writer, sheet_name='Computed', index=False)
+
+print(f"✅ Completed. Outputs in:\n  {OUTPUT_FILE}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
