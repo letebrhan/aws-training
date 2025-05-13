@@ -45,14 +45,7 @@ computes all derived fields, and writes results to
 Interview20250501_result/TestAnswers_filled.xlsx.
 """
 
-# Add this at the top of your script
-from dotenv import load_dotenv
 
-# Load .env file
-load_dotenv()
-
-# Now read the API key from the environment
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
 
 import os
@@ -63,12 +56,21 @@ import pandas as pd
 from dateutil import parser as date_parser
 import openai
 
+# Add this at the top of your script
+from dotenv import load_dotenv
+
+# Load .env file
+load_dotenv()
+# Now read the API key from the environment
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+
 # 1) Working directory & paths
 cwd  = os.getcwd()
-path = os.path.join(cwd, 'Interview20250501_result')
+path = os.path.join(cwd, 'Interview20250501_output')
 INPUT_ADS    = os.path.join(path, 'Test42Inputs.xlsx')
 INPUT_ANS    = os.path.join(path, 'TestAnswers.xlsx')
-OUTPUT_FILE  = os.path.join(path, 'TestAnswers_filled.xlsx')
+OUTPUT_FILE  = os.path.join(path, 'TestAnswers_LLM_filled.xlsx')
 ADS_SHEET    = 'Sheet1'
 ANS_SHEET    = 'Answers'
 
@@ -88,38 +90,45 @@ DATE_PATTERNS = [r'Last HSI[:\\s]+([A-Za-z0-9 ,/-]+)', r'Date of HSI[:\\s]+([A-Z
 SYSTEM_PROMPT = (
     "You are an expert JSON extraction assistant specialized in parsing Gulfstream G-IV, G-IVSP, and G450 aircraft ads.\n\n"
     "Your task is to extract detailed engine data for BOTH LEFT and RIGHT engines from free-form ad text.  "
-    "Return **only** a JSON object with two keys—\"LEFT\" and \"RIGHT\"—each containing an object with exactly these fields in this order:\n\n"
-    
-    "  • TTAF: total airframe hours (integer). Look anywhere in the ad for patterns matching:\n"
-    "       - `Airframe Total Time (\\d+)`\n"
-    "       - `TTAF:\\s*(\\d+)\\s*Hrs`\n"
-    "       - `Airframe:\\s*(\\d+)\\s*Hrs`\n\n"
-    "  • TSN: time since new (hours, integer)\n"
+    "Return ONLY a JSON object with two keys—\"LEFT\" and \"RIGHT\"—each containing an object with exactly these fields in this order:\n\n"
+
+    "  • TTAF: total airframe hours (integer). Extract this only once from the ad. Shared between LEFT and RIGHT. Look anywhere in the ad for patterns like:\n"
+    "       - 'Airframe Total Time (\\d+)'\n"
+    "       - 'TTAF:\\s*(\\d+)\\s*Hrs'\n"
+    "       - 'Airframe:\\s*(\\d+)\\s*Hrs'\n\n"
+
+    "  • TSN: time since new (integer).\n"
+    "       - Extract from the engine table rows only — never from the TTAF.\n"
+    "       - In engine rows, the value immediately following the engine model (e.g., “611-8”, “611-8 (GI V)”) is the **Serial Number** (e.g., “16455”), not TSN.\n"
+    "       - TSN and CSN follow the Serial Number.\n"
+    "       - Example: Rolls Royce TAY 611-8 16455 8467 2654\n"
+    "         → Serial# = 16455, TSN = 8467, CSN = 2654\n"
+
     "  • CSN: cycles since new (integer)\n"
-    "  • TSML: time since mid-life/HSI (hours, integer)\n"
-    "  • TSOH: time since last overhaul (hours, float)\n"
+    "  • TSML: time since mid-life or HSI (integer)\n"
+    "  • TSOH: time since last overhaul (float)\n"
     "  • CSML: cycles since mid-life (integer)\n"
     "  • CSOH: cycles since overhaul (integer)\n"
-    "  • EarlyTBO: mid-life interval (integer). **If the engine table includes a “Mid life next due” (or similar) column, use that value**, else default to 4000\n"
-    "  • HoursSinceHSI: same as TSML (integer)\n"
-    "  • DateOfLastHSI: ISO-8601 date (YYYY-MM-DD) of last HSI, or null. Extract any `<Month> <Year>` following “Midlife c/w” or “Ten Year Calendar:”\n"
-    "  • TimeRemainingBeforeOverhaul: EarlyTBO - TSML (number)\n"
-    "  • OnCondition_R: true if “On Condition” appears anywhere, else false\n"
-    "  • BasisOfCalculation: one of “TSN”, “TSML”, “explicit”, “program”, “on_condition”\n"
-    "  • DateOfLastOverhaul: ISO-8601 date of last overhaul, or null\n"
-    "  • DateOfOverhaulDue: ISO-8601 date when next overhaul is due, or null\n"
-    "  • years_left_for_operation: TimeRemainingBeforeOverhaul ÷ 450 (float), or null\n"
-    "  • AvgHoursLeft_450h_per_year: same as TimeRemainingBeforeOverhaul (float)\n"
-    "  • EngineProgramNameOngoingOrEnrolled_1: maintenance program name, or “None”\n\n"
+    "  • EarlyTBO: planned mid-life interval (usually 4000), or null if unavailable\n"
+    "  • HoursSinceHSI: same as TSML\n"
+    "  • DateOfLastHSI: ISO 8601 format date parsed from 'Midlife c/w <Month> <Year>' or similar\n"
+    "  • TimeRemainingBeforeOverhaul: EarlyTBO - TSML\n"
+    "  • OnCondition_R: true if 'On Condition' appears anywhere in ad\n"
+    "  • BasisOfCalculation: one of 'TSN', 'TSML', 'explicit', 'program', or 'on_condition'\n"
+    "  • DateOfLastOverhaul: ISO 8601, or null\n"
+    "  • DateOfOverhaulDue: ISO 8601, or null\n"
+    "  • years_left_for_operation: TimeRemainingBeforeOverhaul / 450\n"
+    "  • AvgHoursLeft_450h_per_year: same as TimeRemainingBeforeOverhaul\n"
+    "  • EngineProgramNameOngoingOrEnrolled_1: the name of the engine program, or null\n\n"
 
     "**Formatting rules:**\n"
-    "  - JSON numbers for numeric fields (no quotes)\n"
-    "  - Strings in double quotes\n"
-    "  - ISO 8601 dates (YYYY-MM-DD)\n"
+    "  - JSON numbers must not be quoted\n"
+    "  - Strings use double quotes\n"
+    "  - Dates in 'YYYY-MM-DD' format\n"
     "  - true/false for booleans\n"
-    "  - null for missing values\n\n"
+    "  - null for missing data\n\n"
 
-    "**Engine-table column headers may begin with any of these variants (whitespace-delimited):**\n"
+    "**Engine-table header variants:**\n"
     "  1. Loc. Make Model Serial# TSN CSN TSML L\n"
     "  2. Loc. Make Model Serial# TSN CSN L\n"
     "  3. Loc. Make Model Serial# TSN CSN TSOH L\n"
@@ -128,31 +137,41 @@ SYSTEM_PROMPT = (
     "  6. Loc. Model Serial# TSN CSN L\n"
     "  7. Loc. TSN CSN TSOH CSOH L\n\n"
 
-    "**Parsing procedure:**\n"
+    "**Parsing steps:**\n"
     "  1. Extract TTAF using regex from the entire ad.\n"
-    "  2. Find the first line whose tokens include “TSN” and “CSN” (case-insensitive).\n"
-    "  3. Split that header on whitespace; record its zero-based indices of TSN, CSN, TSML, TSOH, CSOH, CSML, and any “Mid life next due” column → EarlyTBO_IDX.\n"
-    "  4. Read the next two lines below the header as the LEFT and RIGHT engine rows.\n"
-    "     - Use the side label token in each row to assign LEFT or RIGHT:\n"
-    "           Acceptable LEFT labels: “L”, “Left”, “Engine 1”\n"
-    "           Acceptable RIGHT labels: “R”, “Right”, “Engine 2”\n"
-    "     - Engine rows can appear in any order (LEFT may be first or second).\n"
-    "     - If the narrative includes paired values (e.g., 'Midlife c/w', 'Overhaul next due'),\n"
-    "       assign the first value to the LEFT engine, second to the RIGHT.\n"
-    "  5. Parse each row on whitespace using the column indices.\n"
-    "  6. Extract narrative HSI date using `<Month> <Year>` after “Midlife c/w” or “Ten Year Calendar:”, convert to `YYYY-MM-01`.\n"
-    "  7. Detect OnCondition_R if “On Condition” is mentioned anywhere.\n"
-    "  8. Compute:\n"
-    "     - TimeRemainingBeforeOverhaul = max(0, EarlyTBO − TSML)\n"
-    "     - years_left_for_operation = TimeRemainingBeforeOverhaul ÷ 450\n"
-    "     - AvgHoursLeft_450h_per_year = TimeRemainingBeforeOverhaul\n"
-    "  9. Emit ONLY the final JSON with “LEFT” and “RIGHT” keys — no explanations, no extra keys, no commentary.\n\n"
+    "  2. Find the first line containing 'TSN' and 'CSN' (case-insensitive).\n"
+    "  3. Record the positions (indices) of TSN, CSN, TSML, TSOH, CSOH, CSML, EarlyTBO (if present).\n"
+    "  4. Extract the 2 lines immediately below as engine rows.\n"
+    "  5. Use the label BEFORE TSN (e.g. 'L', 'Left', 'Engine 1') to assign LEFT; use 'R', 'Right', 'Engine 2' to assign RIGHT.\n"
+    "     – If label is ambiguous or missing, match TSN/CSN/Serial# positionally or narratively.\n"
+    "  6. Slice engine row using column indices, map values to fields accordingly.\n"
+    "  7. Extract HSI date using '<Month> <Year>' after 'Midlife c/w' or 'Ten Year Calendar:', convert to 'YYYY-MM-01'.\n"
+    "  8. Detect if 'On Condition' is present in ad.\n"
+    "  9. Compute:\n"
+    "     – TimeRemainingBeforeOverhaul = max(0, EarlyTBO - TSML)\n"
+    "     – years_left_for_operation = TimeRemainingBeforeOverhaul / 450\n"
+    "     – AvgHoursLeft_450h_per_year = TimeRemainingBeforeOverhaul\n"
+    " 10. If no table is found, search narrative sections for patterns matching 'engine serial', 'TSN:', 'TSML:', etc.\n"
+    "     – Use fallback values only when confident.\n"
+    " 11. Return ONLY valid JSON with 'LEFT' and 'RIGHT' keys. No extra text or explanation.\n\n"
+
     "Now extract structured JSON for both engines from this ad text:"
 )
 
 
 
-
+def extract_ttaf_from_ad(ad_text):
+    # Define regex patterns for TTAF
+    patterns = [
+        r"TTAF:\s*(\d+)\s*Hrs",
+        r"Airframe Total Time\s*(\d+)",
+        r"Airframe:\s*(\d+)\s*Hrs"
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, ad_text, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return None
 
 # Function to extract data from ad text
 def call_llm_extraction(ad_text, ad_id=None):
@@ -173,6 +192,14 @@ def call_llm_extraction(ad_text, ad_id=None):
 
         left = parsed.get("LEFT", {})
         right = parsed.get("RIGHT", {})
+        # If TTAF is in the global response, inject it into both engines
+        if "TTAF" in parsed['LEFT'] and "TTAF" in parsed['RIGHT']:
+            parsed['RIGHT'].pop('TTAF')
+        else:
+            # Inject TTAF into both LEFT and RIGHT
+            ttaf_value = extract_ttaf_from_ad(ad_text)
+            if ttaf_value is not None:
+                left["TTAF"] = ttaf_value
 
         for engine, position in [(left, "LEFT"), (right, "RIGHT")]:
             engine["Position"] = position
@@ -233,26 +260,31 @@ def compute_metrics(ad_text, ad_id):
         date_last_hsi   = fields.get('DateOfLastHSI')  # not in text
 
         # 6) Compute remaining & basis
-        rem, basis = None, None
+        time_remaining_by_tsn = tbo_hours - tsn if tsn is not None else float("inf")
+        time_remaining_by_tsoh = midlife_hours - tsoh if tsoh is not None else float("inf")
+
+        time_remaining_before_overhaul, basis = None, None
         if program_name:
-            rem, basis = tbo_hours, 'program'
+            time_remaining_before_overhaul, basis = tbo_hours, 'program'
         else:
             explicit = extract_number(ad_text, LEFT_PATTERNS)
             if explicit is not None:
-                rem = explicit
+                time_remaining_before_overhaul = explicit
                 basis = 'explicit'
             elif tsml is not None:
-                rem = max(0, midlife_hours - tsml)
+                time_remaining_before_overhaul = max(0, midlife_hours - tsml)
                 basis = 'Time Since Mid-Life(TSML)'
-            elif tsoh is not None:
-                rem = max(0, tbo_hours - tsoh)
-                basis = 'time since last overhaul(TSOH)'
-            elif tsn is not None:
-                rem = max(0, tbo_hours - tsn)
-                basis = 'Time Since New(TSN)'             
+            else:
+                if time_remaining_by_tsoh < time_remaining_by_tsn:
+                    time_remaining_before_overhaul = max(0, time_remaining_by_tsoh)
+                    basis = 'time since last overhaul(TSOH)'
+                else:
+                    time_remaining_before_overhaul = max(0, time_remaining_by_tsn)
+                    basis = 'Time Since New(TSN)' 
+                            
 
-        years_left = round(rem / annual_usage, 2) if rem is not None else None
-        avg_hours_left_450h_per_year = rem
+        years_left = round(time_remaining_before_overhaul / annual_usage, 2) if time_remaining_before_overhaul is not None else None
+        avg_hours_left_450h_per_year = time_remaining_before_overhaul
         
         # Date of Overhaul Due
         due_date = fields.get('DateOfOverhaulDue')
@@ -291,7 +323,7 @@ def compute_metrics(ad_text, ad_id):
             'Early TBO': early_tbo,
             'Hours since HSI': hours_since_hsi,
             'Date of Last HSI': date_last_hsi,
-            'Time remaining before overhaul': rem,
+            'Time remaining before overhaul': time_remaining_before_overhaul,
             'On Condition_R': on_cond,
             'Basis of Calculation': basis,
             'Date of Last Overhaul': fields.get('DateOfLastOverhaul'),
